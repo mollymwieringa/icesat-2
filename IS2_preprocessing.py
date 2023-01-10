@@ -171,12 +171,17 @@ def read_ATL10(data_in, data_out,
                             unc = unc_var[:]
 
                             # access the open ocean mask
-                            mask_var = f['/%s/freeboard_beam_segment/height_segments/height_segment_ssh_flag' % track]
-                            mask = mask_var[:]
+                            ssh_flag_var = f['/%s/freeboard_beam_segment/height_segments/height_segment_ssh_flag' % track]
+                            ssh_flag = ssh_flag_var[:]
+                            
 
                             # access the surface type classification
                             surf_var = f['/%s/freeboard_beam_segment/height_segments/height_segment_type' % track]
                             surf = surf_var[:]
+                            
+                            # access the segment length
+                            lenseg_var = f['/%s/freeboard_beam_segment/height_segments/height_segment_length_seg' % track]
+                            lenseg = lenseg_var[:]
 
                             # handle FillValue
                             _FillValue = datavar.attrs['_FillValue']
@@ -184,8 +189,9 @@ def read_ATL10(data_in, data_out,
                             unc[unc == _FillValue] = np.nan
 
                             # collect time information
-                            timevar = f['/%s/freeboard_beam_segment/delta_time' % track]
+                            timevar = f['/%s/freeboard_beam_segment/beam_freeboard/delta_time' % track]
                             time = timevar[:]
+
 
                             # detect_level_ice
                             level_ice_mask = detect_level_ice(datavar)
@@ -193,9 +199,10 @@ def read_ATL10(data_in, data_out,
                             # make dataset, decode time to cftime object, and save in a list 
                             data_list.append(xr.decode_cf(xr.Dataset({"freeboard": (["time"], data),
                                                                       "uncertainty": (["time"], unc),
-                                                                      "mask": (["time"], mask),
+                                                                      "ssh_flag": (["time"], ssh_flag),
                                                                       "level_ice":(["time"], level_ice_mask),
                                                                       "surface_type": (["time"], surf),
+                                                                      "segment_length": (["time"], lenseg),
                                                                       "longitude": (["time"], longitude),
                                                                       "latitude": (["time"], latitude)
                                                                       },
@@ -205,12 +212,88 @@ def read_ATL10(data_in, data_out,
                                                                               }
                                                                      )
                                                           )
-                                             )
+                                            )
+                            
+                            # Run additional processing functions
+                            data = compute_floe_chords(data)
+                            
+                            # Save in a list 
+                            data_list.append(data)
 
             day_data = xr.concat(data_list, dim = 'time', compat = 'no_conflicts')
             filename = 'IS2_'+dir_day+'.nc'
             day_data.to_netcdf(data_out+filename)
             print(dir_day + ' done!')
+
+            
+
+            
+def compute_floe_chords(data):
+    """
+    "compute_floe_chords" generates an ice-ocean mask for the ICESat-2 data in
+    xarray format. Floe chords are measured from the ice-ocean mask and each 
+    ice segment in ICESat-2 is assigned with the length of the floe chord it
+    is part of.
+    
+    Inputs:
+    (1) xarray.DataSet: ICESat-2 data
+    
+    Outputs:
+    (1) xarray.DataSet: ICESat-2 data including a floe_chord variable
+
+    Author: Nils Hutter (nhutter@uw.edu, Univ. Washington ICG)
+    """
+    
+    # Initialise field to output floe chords
+    data['floe_chord'] = data.freeboard.copy()
+                                             
+    
+    # Create ice mask
+    non_nan = np.isfinite(data.freeboard)
+    ice = (~np.logical_or(np.logical_and(data.freeboard==0,data.surface_type>=6),
+                                            data.ssh_flag>0)).where(np.isfinite(data.freeboard))
+
+    # Check for series of valid segments
+    valid_segs = contiguous_regions(non_nan.data)
+
+    # Loop through all series of valid segments
+    for ivseg in valid_segs:
+        # Detect floes in the ice-ocean mask
+        segs = contiguous_regions(ice.data[ivseg[0]:ivseg[1]])
+        for iseg in segs:
+            if iseg[0]!=0 and iseg[1]!=ivseg[1]-ivseg[0]:
+                data['floe_chord'][iseg[0]+ivseg[0]] = np.sum(data.segment_length[iseg[0]+ivseg[0]])
+                
+    return data
+
+    
+    
+            
+def contiguous_regions(condition):
+    """Finds contiguous True regions of the boolean array "condition". Returns
+    a 2D array where the first column is the start index of the region and the
+    second column is the end index."""
+
+    # Find the indicies of changes in "condition"
+    d = np.diff(condition)
+    idx, = d.nonzero() 
+
+    # We need to start things after the change in "condition". Therefore, 
+    # we'll shift the index by 1 to the right.
+    idx += 1
+
+    if condition[0]:
+        # If the start of condition is True prepend a 0
+        idx = np.r_[0, idx]
+
+    if condition[-1]:
+        # If the end of condition is True, append the length of the array
+        idx = np.r_[idx, condition.size-1] # Edit
+
+    # Reshape the result into two columns
+    idx.shape = (-1,2)
+    return idx
+
 
 
 def detect_level_ice(freeboard_data):
@@ -362,3 +445,4 @@ def haversine_distance(x1, x2, y1, y2):
     dist = 2*np.arcsin(np.sqrt(np.sin((x1 - y1)/2)**2 +
                                np.cos(x1)*np.cos(y1)*np.sin((x2-y2)/2)**2))
     return dist
+
