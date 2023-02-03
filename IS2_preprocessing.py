@@ -194,7 +194,7 @@ def read_ATL10(data_in, data_out,
 
 
                             # detect_level_ice
-                            level_ice_mask = detect_level_ice(datavar)
+                            level_mask, thresholds, gradients, distances = detect_level_ice(datavar, latitude, longitude)
 
                             # make dataset, decode time to cftime object, and save in a list 
                             data_list.append(xr.decode_cf(xr.Dataset({"freeboard": (["time"], data),
@@ -224,8 +224,6 @@ def read_ATL10(data_in, data_out,
             filename = 'IS2_'+dir_day+'.nc'
             day_data.to_netcdf(data_out+filename)
             print(dir_day + ' done!')
-
-            
 
             
 def compute_floe_chords(data):
@@ -294,9 +292,100 @@ def contiguous_regions(condition):
     idx.shape = (-1,2)
     return idx
 
+def haversine_distance(x1, x2, y1, y2):
+
+    dist = 2*np.arcsin(np.sqrt(np.sin((x1 - y1)/2)**2 +
+                               np.cos(x1)*np.cos(y1)*np.sin((x2-y2)/2)**2))
+    return dist
+
+def latlon2dist(data, latitude, longitude):
+        distances = []
+        for i in range(0, len(data)-1):
+                x1 = latitude[i]
+                y1 = longitude[i]
+
+                x2 = latitude[i+1]
+                y2 = longitude[i+1]
+
+                dist = 1000 * haversine_distance(x1, x2, y1, y2)
+                distances.append(dist)
+                
+        # says that the distance between two points aligns with the second data point
+        distances = np.insert(distances, 0, 0)
+        
+        return distances
 
 
-def detect_level_ice(freeboard_data):
+def create_mask(data, distances):
+    
+    # calculate the gradient of the data
+    gradient = np.gradient(data)
+
+    # create mask 
+    mask = []
+    thresholds = []
+    for x in range(0, len(gradient)):
+        # determine "smart" threshold
+        if np.isnan(gradient[x]):
+            grad_thresh = np.nan
+        elif distances[x] < 100:
+            # use the 100m threshold for any section that is less that 100m
+            grad_thresh = 0.4
+        else:
+            # otherwise, lower the threshold by the weighted distance between points
+            grad_thresh = 0.4 * 100/distances[x]
+            
+        # store gradient thresholds for examination later
+        thresholds.append(grad_thresh)
+        
+        # if the data was NaN, the mask is NaN
+        if np.isnan(gradient[x]):
+            mask.append(np.nan)
+        # if the gradient is greater than the threshold, assign it 0 (False)
+        elif abs(gradient[x]) > grad_thresh:
+            mask.append(0)
+        # else, assign the mask 1 (True)
+        else:
+            mask.append(1)
+            
+    for x in range(0, len(mask)):
+        # both distance and the mask use the right end point of the section to indicate level or not-level
+        if distances[x] < 100 and mask[x] == 1:
+            mask = check_neighbors(x, distances, mask)
+
+    return mask, thresholds, gradient
+
+def check_neighbors(x, distances, mask):
+    
+    # we are looking as a segment that has been marked level but is less than 100 m long
+    
+    # check the segment to the left
+    if x != 0:
+        seg_left = mask[x-1]
+        
+        if seg_left != 1:
+            # if the previous segment is not level, set this one not level...
+            mask[x] = 0
+    
+    # unless the segment to the right is level and long enough.
+    if x != (len(mask)-1):
+        seg_right = mask[x+1]
+        seg_right_len = distances[x+1]
+    
+        if seg_right != 1:
+            # if the next segment to the right is not level, set this one not level 
+            mask[x] = 0
+        elif seg_right == 1 and seg_right_len < 100:
+            # if the next segment is level but less than 100m long, test added lengths
+            if seg_right_len + distances[x] < 100:
+                # if added lengths are still less than 100m, set not level
+                mask[x] = 0
+        else:
+            pass
+    
+    return mask
+
+def detect_level_ice(data, latitude, longitude):
     '''
     Implements a gradient test to detect level or presumably deformed ice. For
     now, this test is applied to freeboard data and follows von Albedyll et al.
@@ -310,139 +399,25 @@ def detect_level_ice(freeboard_data):
 
     Inputs:
     (1) freeboard data
+    (2) latitude
+    (3) longitude
 
     Outputs:
     (1) mask array of "level" or "deformed" ice
+    (2) adaptive thresholds used 
+    (3) gradients calculated between points
+    (4) distances between points (meters)
 
     From Rabenstein et al. (2010): Level ice was identified using two criteria.
     First the numerical differentiation of sea-ice thickness along the profile
     using a three-point Langrangian interpolator must be <0.04, and second,
     level-ice sections must extend at least 100m in length...
     '''
+    
+    # calculate the distances between points
+    distances = latlon2dist(data, latitude, longitude)
 
-    # initialize an empty flags object, set index step to 1, and set found to False
-    flags = np.zeros(len(freeboard_data))
-    count = 1
-    found = False
+    mask, thresholds, gradient = create_mask(data, distances)
 
-    # cycle through all the data...
-    for i in range(0, len(freeboard_data)):
-        # use the found flag to keep searching while dist < 100 m
-        x_interp = []
-        while found is not True:
-            # using the anchor point of the cycle... 
-            x1 = freeboard_data.latitude[i]
-            y1 = freeboard_data.longitude[i]
-            # grab the next point along the satellite track to consider
-            # based on the count...
-            x2 = freeboard_data.latitude[i+count]
-            y2 = freeboard_data.longitude[i+count]
-            # and calculate the haversine distance between the two points.
-            dist = 1000 * haversine_distance(x1, x2, y1, y2)
-
-            # if the distance is < 100 meters...
-            if dist < 100:
-                # up the count to look one point further...
-                count += 1
-                # and store the distance for the interpolation later.
-                x_interp.append(dist)
-            # if the distance is > 100 meters
-            else:
-                # set the found flag True to break the loop
-                found = True
-                # set the index to the count reached
-                index = count
-                # set the count back to 1 for next while loop
-                count = 1
-
-        # for the 100 meters-ish segment that's been found...
-        data_to_interpolate = freeboard_data.freeboard[i:index]
-
-        # interpolate between the points...
-        poly = lagrange(x_interp, data_to_interpolate)
-        curve = Polynomial(poly.coef[::-1])*(x_interp)
-
-        # ... and calculate the gradient of the interpolated curve
-        gradient = np.gradient(curve)
-
-        # assign a temporary flag object
-        temp_flags = flags[i:index]
-
-        # find indicies in gradient for which points do not satisfy reqs
-        bad_points = []
-        for x in range(0, len(gradient)):
-            if gradient[x] > 0.04:
-                bad_points.append(x)
-
-        # find the bad point indices pairs that have level ice > 100 m between
-        level_lengths = []
-        prev_bp = bad_points[0]
-        for bp in bad_points[1:]:
-            # if the index before the bad point is not equal to the previous bad point... 
-            if bp-1 != prev_bp:
-                # calculate the length between the point before the bad one and the previous bad one
-                sub_length = x_interp[bp-1] - x_interp[prev_bp]
-                # if the length is >= 100m...
-                if sub_length >= 100:
-                    # store the indices within the gradient curve for those segments
-                    level_lengths.append((prev_bp+1, bp-1))
-            prev_bp = bp
-
-        # first, if this ISN'T the first segment and the last flag of the previous one was 1...
-        if i != 0 and flags[i-1] == 1:
-            # ... set the flags up to the first bad point to 1
-            temp_flags[0:bad_points[0]] = 1
-        # if this IS the first segment or the last flag ISN'T 1...
-        else:
-            # go through the indices pairs for level_lengths > 100 m...
-            for pair in level_lengths:
-                # ... and replace flags with 1 between the two indices
-                temp_flags[pair[0]:pair[1]] = 1
-
-        # check that new flags and old flags don't conflict
-        if i == 0:
-            prev_flags = temp_flags
-
-        # determine conflicts between overlapping flag segments
-        temp_overlap = temp_flags[:-1]
-        prev_overlap = prev_flags[1:]
-        conflicts = temp_overlap - prev_overlap
-
-        # collect locations of conflicts
-        conflict_locations = []
-        for x in range(0, len(conflicts)):
-            if conflicts[x] != 0:
-                conflict_locations.append(x)
-
-        # for each conflict location...
-        for c_loc in conflict_locations:
-            # ... if the previous set of flags saved the conflict location as level...
-            if prev_overlap[c_loc] == 1:
-                # ... save the new flag at that overlap as level as well.
-                temp_overlap[c_loc] = 1
-            # if the previous set didn't save as level...
-            else:
-                # ... resolve the conflict by saving as not level
-                temp_overlap[c_loc] = 0
-
-        # save the corrected conflicts back into the temporary flag object
-        temp_flags[:-1] = temp_overlap
-
-        # once the corrections have been applied save a for the next set of prev_flags
-        prev_flags = temp_flags
-
-        # save current temp_flags back into list of all flags
-        flags[i:index] = temp_flags
-
-    # save all calculated flags to an array and return mask
-    mask = np.array(flags)
-
-    return mask
-
-
-def haversine_distance(x1, x2, y1, y2):
-
-    dist = 2*np.arcsin(np.sqrt(np.sin((x1 - y1)/2)**2 +
-                               np.cos(x1)*np.cos(y1)*np.sin((x2-y2)/2)**2))
-    return dist
+    return mask, thresholds, gradient, distances
 
