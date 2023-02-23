@@ -192,7 +192,6 @@ def read_ATL10(data_in, data_out,
                             timevar = f['/%s/freeboard_beam_segment/beam_freeboard/delta_time' % track]
                             time = timevar[:]
 
-
                             # detect_level_ice
                             level_mask, thresholds, gradients, distances = detect_level_ice(datavar, latitude, longitude)
 
@@ -292,34 +291,21 @@ def contiguous_regions(condition):
     idx.shape = (-1,2)
     return idx
 
-def haversine_distance(x1, x2, y1, y2):
 
-    dist = 2*np.arcsin(np.sqrt(np.sin((x1 - y1)/2)**2 +
-                               np.cos(x1)*np.cos(y1)*np.sin((x2-y2)/2)**2))
+def latlon2dist(data,latitude, longitude):
+    p = pyproj.Proj('+proj=stere +lat_0=90 +lat_ts=75')
+    
+    x,y = p(longitude, latitude)
+    
+    dist = np.sqrt(np.diff(x)**2 + np.diff(y)**2)
+    dist = np.insert(dist, 0, 0)
     return dist
-
-def latlon2dist(data, latitude, longitude):
-        distances = []
-        for i in range(0, len(data)-1):
-                x1 = latitude[i]
-                y1 = longitude[i]
-
-                x2 = latitude[i+1]
-                y2 = longitude[i+1]
-
-                dist = 1000 * haversine_distance(x1, x2, y1, y2)
-                distances.append(dist)
-                
-        # says that the distance between two points aligns with the second data point
-        distances = np.insert(distances, 0, 0)
-        
-        return distances
 
 
 def create_mask(data, distances):
     
     # calculate the gradient of the data
-    gradient = np.gradient(data)
+    gradient = np.gradient(data, np.cumsum(distances))
 
     # create mask 
     mask = []
@@ -328,12 +314,9 @@ def create_mask(data, distances):
         # determine "smart" threshold
         if np.isnan(gradient[x]):
             grad_thresh = np.nan
-        elif distances[x] < 100:
-            # use the 100m threshold for any section that is less that 100m
-            grad_thresh = 0.4
         else:
             # otherwise, lower the threshold by the weighted distance between points
-            grad_thresh = 0.4 * 100/distances[x]
+            grad_thresh = 0.004 #* distances[x]/100
             
         # store gradient thresholds for examination later
         thresholds.append(grad_thresh)
@@ -350,7 +333,7 @@ def create_mask(data, distances):
             
     for x in range(0, len(mask)):
         # both distance and the mask use the right end point of the section to indicate level or not-level
-        if distances[x] < 100 and mask[x] == 1:
+        if distances[x] < 10 and mask[x] == 1:
             mask = check_neighbors(x, distances, mask)
 
     return mask, thresholds, gradient
@@ -375,9 +358,9 @@ def check_neighbors(x, distances, mask):
         if seg_right != 1:
             # if the next segment to the right is not level, set this one not level 
             mask[x] = 0
-        elif seg_right == 1 and seg_right_len < 100:
+        elif seg_right == 1 and seg_right_len < 10:
             # if the next segment is level but less than 100m long, test added lengths
-            if seg_right_len + distances[x] < 100:
+            if seg_right_len + distances[x] < 10:
                 # if added lengths are still less than 100m, set not level
                 mask[x] = 0
         else:
@@ -391,11 +374,11 @@ def detect_level_ice(data, latitude, longitude):
     now, this test is applied to freeboard data and follows von Albedyll et al.
     (2022). The approach was to anchor the search at each subsequent index and
     scan forward through the satellite points until a distance between points
-    of more than 100m is reached. This segment is then treated according to
+    of more than 10m is reached. This segment is then treated according to
     Rabenstein et al. (2010) to determine whether any sufficient part of the
     segment (including the beginning portion that may continue from the
     previous segment) is considered level. The function then steps forward to
-    the next index and interates.
+    the next index and iterates.
 
     Inputs:
     (1) freeboard data
@@ -410,12 +393,12 @@ def detect_level_ice(data, latitude, longitude):
 
     From Rabenstein et al. (2010): Level ice was identified using two criteria.
     First the numerical differentiation of sea-ice thickness along the profile
-    using a three-point Langrangian interpolator must be <0.04, and second,
+    using a three-point Langrangian interpolator must be <0.04/100m, and second,
     level-ice sections must extend at least 100m in length...
     '''
     
     # calculate the distances between points
-    distances = latlon2dist(data, latitude, longitude)
+    distances = latlon2dist(latitude, longitude)
 
     mask, thresholds, gradient = create_mask(data, distances)
 
